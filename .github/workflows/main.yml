@@ -1,0 +1,356 @@
+name: SA Calculator v98.63.6 - Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sa-calculator-android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-build:
+    name: Verify v98.63 calculator-only source, regression and Android build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Set up Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Select the exact v98.63 source archive or extracted project root (never silently build stale files)
+        id: locate
+        env:
+          SA_EXPECTED_VERSION: '1.98.63-v98.63'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const os = require('node:os');
+          const cp = require('node:child_process');
+          const workspace = process.env.GITHUB_WORKSPACE;
+          const expectedVersion = process.env.SA_EXPECTED_VERSION;
+          if (!expectedVersion) throw new Error('SA_EXPECTED_VERSION is required.');
+          const candidates = [];
+          const rootManifest = path.join(workspace, 'package.json');
+          if (fs.existsSync(rootManifest)) {
+            const pkg = JSON.parse(fs.readFileSync(rootManifest, 'utf8'));
+            if (pkg.name === 'sa-calculator' && pkg.version) {
+              candidates.push({ kind: 'root', version: pkg.version, appDir: workspace, tie: 0 });
+            }
+          }
+          const findArchives = (dir, depth = 0) => {
+            if (depth > 5) return [];
+            let out = [];
+            for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (ent.name === '.git' || ent.name === 'node_modules') continue;
+              const full = path.join(dir, ent.name);
+              if (ent.isDirectory()) out.push(...findArchives(full, depth + 1));
+              else if (/^SA-Calculator-v.*\.zip$/i.test(ent.name)) out.push(full);
+            }
+            return out;
+          };
+          for (const archive of findArchives(workspace).sort()) {
+            cp.execFileSync('unzip', ['-tq', archive], { stdio: 'inherit' });
+            const entries = cp.execFileSync('unzip', ['-Z1', archive], { encoding: 'utf8' }).split(/\r?\n/).filter(Boolean);
+            const manifests = entries.filter(x => /(^|\/)package\.json$/.test(x) && !/(^|\/)(node_modules|www|android|\.git)\//.test(x));
+            if (manifests.length !== 1) throw new Error(`${archive}: expected exactly one app package.json, found ${manifests.length}`);
+            for (const entry of entries) {
+              if (entry.startsWith('/') || entry.split('/').includes('..')) throw new Error(`Unsafe ZIP path in ${archive}: ${entry}`);
+            }
+            const pkg = JSON.parse(cp.execFileSync('unzip', ['-p', archive, manifests[0]], { encoding: 'utf8' }));
+            if (pkg.name !== 'sa-calculator' || !pkg.version) throw new Error(`${archive}: invalid SA Calculator package manifest`);
+            const extractDir = path.join(os.tmpdir(), `sa-calculator-${pkg.version.replace(/[^a-zA-Z0-9.-]/g, '-')}`);
+            fs.rmSync(extractDir, { recursive: true, force: true });
+            fs.mkdirSync(extractDir, { recursive: true });
+            cp.execFileSync('unzip', ['-q', archive, '-d', extractDir]);
+            candidates.push({ kind: 'archive', version: pkg.version, appDir: path.dirname(path.join(extractDir, manifests[0])), archive, tie: 1 });
+          }
+          if (!candidates.length) throw new Error('No valid SA Calculator project found: upload the extracted v98.63 project or its complete source ZIP.');
+          const exactCandidates = candidates.filter(candidate => candidate.version === expectedVersion);
+          if (!exactCandidates.length) {
+            const found = [...new Set(candidates.map(candidate => candidate.version))].join(', ');
+            throw new Error(`Exact source ${expectedVersion} not found. Found: ${found || 'none'}. Upload SA-Calculator-v98.63-Calculator-Only.zip or its extracted root.`);
+          }
+          // Prefer the exact-version source ZIP over an extracted repository root;
+          // unrelated newer/older ZIPs can never silently override the requested build.
+          exactCandidates.sort((a, b) => b.tie - a.tie || String(a.archive || '').localeCompare(String(b.archive || '')));
+          const selected = exactCandidates[0];
+          if (selected.kind === 'archive') console.log(`Selected exact v98.63 source archive: ${selected.archive}`);
+          else console.log(`Selected exact v98.63 repository source: ${selected.appDir}`);
+          const appDir = fs.realpathSync(selected.appDir);
+          const pkg = JSON.parse(fs.readFileSync(path.join(appDir, 'package.json'), 'utf8'));
+          if (pkg.version !== selected.version) throw new Error('Selected source version changed during extraction.');
+          if (pkg.version !== expectedVersion) throw new Error(`Wrong/stale source selected: expected ${expectedVersion}, got ${pkg.version}.`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `app_dir=${appDir}\napp_version=${pkg.version}\n`);
+          console.log(`Verified selected app root: ${appDir}`);
+          console.log(`Verified selected app version: ${pkg.version}`);
+          NODE
+
+      - name: Verify source files and project configuration
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          required_files=(
+            package.json
+            README.md
+            MICRO-LEVEL-AUDIT-v98.63.md
+            CHANGELOG-v98.63.md
+            QA-RESULTS-v98.63.md
+            QA-RESULTS-v98.63.6.md
+            RELEASE-LIMITATIONS-v98.63.md
+            RELEASE-VERIFICATION.md
+            SCREENSHOT-REVIEW-v98.63.6.md
+            design-reference/18-screen-inventory.json
+            design-reference/MASTER-SCREEN-INVENTORY-v98.63.json
+            capacitor.config.json
+            index.html
+            server.js
+            service-worker.js
+            manifest.webmanifest
+            assets/js/app.js
+            assets/js/localization.js
+            assets/js/currency-localized-names.js
+            assets/js/theme-bootstrap.js
+            assets/css/app.css
+            assets/css/app-base.css
+            assets/css/rebuild-v98.33.css
+            assets/css/rebuild-v98.39.css
+            assets/css/rebuild-v98.41.css
+            assets/css/rebuild-v98.44.css
+            assets/css/rebuild-v98.47.css
+            assets/css/rebuild-v98.48.css
+            assets/css/rebuild-v98.50.css
+            assets/css/rebuild-v98.51.css
+            assets/css/rebuild-v98.55.css
+            assets/css/rebuild-v98.60.css
+            assets/css/rebuild-v98.62.css
+            assets/css/rebuild-v98.63-hotfix.css
+            assets/css/rebuild-v98.63.6-final-fix.css
+            tests/v9855-reference-proportional-keypad.test.mjs
+            tests/v9862-home-layout-regression.test.mjs
+            tests/v9863-hotfix-layout.test.mjs
+            tests/v98634-marked-screenshot-cleanup.test.mjs
+            tests/v98632-video-review-regression.test.mjs
+            assets/brand/sa-calculator-icon.png
+            assets/brand/sa-calculator-home-logo.svg
+            assets/brand/sa-home-neon-wave.svg
+            scripts/prepare-android-web.mjs
+            scripts/patch-android-native.mjs
+            assets/brand/android-icons/mipmap-anydpi-v26/ic_launcher.xml
+          )
+          for file in "${required_files[@]}"; do
+            if [ ! -s "$file" ]; then
+              echo "::error::Required source file missing or empty: $file"
+              exit 1
+            fi
+          done
+          test -d tests || { echo '::error::Regression tests directory missing.'; exit 1; }
+
+          node <<'NODE'
+          const fs = require('node:fs');
+          const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          if (p.name !== 'sa-calculator') throw new Error(`Unexpected package name: ${p.name}`);
+          const html = fs.readFileSync('index.html', 'utf8');
+          if (!html.includes(p.version)) throw new Error(`Stale/mismatched UI bundle: index.html does not declare package version ${p.version}`);
+          const appJs = fs.readFileSync('assets/js/app.js', 'utf8');
+          if (!appJs.includes(`const APP_VERSION = '${p.version}'`)) throw new Error('Runtime APP_VERSION does not match package.json.');
+          const manifest = JSON.parse(fs.readFileSync('manifest.webmanifest', 'utf8'));
+          if (manifest.version !== p.version) throw new Error('PWA manifest version does not match package.json.');
+          const sw = fs.readFileSync('service-worker.js', 'utf8');
+          // Cache migration marker: sa-calculator-v98-63-live-currency-dock-fix-v98635
+          if (!sw.includes('sa-calculator-v98-63-live-currency-dock-fix-v98635')) throw new Error('Service-worker cache namespace does not match v98.63.');
+          if (!fs.existsSync('assets/brand/sa-home-neon-wave.svg')) throw new Error('Approved Home wave asset is missing.');
+          for (const script of ['test', 'build:web']) {
+            if (!p.scripts?.[script]) throw new Error(`Missing npm script: ${script}`);
+          }
+          for (const dependency of ['@capacitor/core', '@capacitor/android']) {
+            if (!p.dependencies?.[dependency]) throw new Error(`Missing dependency: ${dependency}`);
+          }
+          if (!p.devDependencies?.['@capacitor/cli']) throw new Error('Missing @capacitor/cli devDependency');
+          const c = JSON.parse(fs.readFileSync('capacitor.config.json', 'utf8'));
+          if (c.webDir !== 'www') throw new Error(`Expected Capacitor webDir www, got ${c.webDir}`);
+          console.log(`Verified ${p.name} ${p.version}`);
+          NODE
+
+      - name: Verify Android SDK availability
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK" ] || [ ! -d "$SDK" ]; then
+            echo '::error::Android SDK is not installed or ANDROID_HOME/ANDROID_SDK_ROOT is invalid.'
+            exit 1
+          fi
+          echo "Android SDK found at $SDK"
+
+      - name: Install npm dependencies
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npm install --no-audit --no-fund --fetch-retries=5 --fetch-timeout=120000
+
+      - name: Verify installed dependencies
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npm ls --depth=0
+
+      - name: Validate JavaScript syntax
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node --check assets/js/app.js
+          node --check assets/js/localization.js
+          node --check assets/js/currency-localized-names.js
+          node --check assets/js/theme-bootstrap.js
+          node --check server.js
+          node --check service-worker.js
+          node --check scripts/prepare-android-web.mjs
+          node --check scripts/patch-android-native.mjs
+
+      - name: Build Android web bundle
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npm run build:web
+
+      - name: Run complete regression tests
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npm test
+
+      - name: Verify generated Android web bundle
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          required_assets=(
+            www/index.html
+            www/service-worker.js
+            www/manifest.webmanifest
+            www/assets/js/app.js
+            www/assets/js/localization.js
+            www/assets/js/currency-localized-names.js
+            www/assets/js/theme-bootstrap.js
+            www/assets/css/app.css
+            www/assets/css/rebuild-v98.33.css
+            www/assets/css/rebuild-v98.39.css
+            www/assets/css/rebuild-v98.44.css
+            www/assets/css/rebuild-v98.46.css
+            www/assets/css/rebuild-v98.47.css
+            www/assets/css/rebuild-v98.48.css
+            www/assets/css/rebuild-v98.50.css
+            www/assets/css/rebuild-v98.51.css
+            www/assets/css/rebuild-v98.55.css
+            www/assets/css/rebuild-v98.60.css
+            www/assets/css/rebuild-v98.62.css
+            assets/css/rebuild-v98.63-hotfix.css
+            assets/css/rebuild-v98.63.6-final-fix.css
+            www/assets/brand/sa-calculator-icon.png
+            assets/brand/sa-home-neon-wave.svg
+            www/assets/brand/sa-calculator-192.png
+            www/assets/brand/sa-calculator-512.png
+            www/assets/brand/sa-calculator-home-logo.svg
+            www/assets/brand/sa-home-neon-wave.svg
+          )
+          for asset in "${required_assets[@]}"; do
+            if [ ! -s "$asset" ]; then
+              echo "::error::Generated Android web asset missing or empty: $asset"
+              exit 1
+            fi
+          done
+          echo 'All generated Android web assets verified.'
+
+      - name: Generate Android project if missing
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ -s android/gradlew ]; then
+            echo 'Existing Android Gradle wrapper found.'
+          elif [ ! -e android ]; then
+            npx cap add android
+          else
+            echo '::error::android directory exists but gradlew is missing; refusing destructive replacement.'
+            exit 1
+          fi
+
+      - name: Sync Capacitor Android
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npx cap sync android
+
+      - name: Apply premium Android launcher icon, splash theme and edge-to-edge insets
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npm run android:brand
+
+      - name: Verify Gradle wrapper
+        working-directory: ${{ steps.locate.outputs.app_dir }}/android
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -s gradlew
+          chmod +x gradlew
+          ./gradlew --version
+
+      - name: Build Android debug APK
+        working-directory: ${{ steps.locate.outputs.app_dir }}/android
+        run: ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK and checksum
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          APK='android/app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$APK"
+          unzip -tq "$APK"
+          unzip -Z1 "$APK" | grep -q '^AndroidManifest.xml$'
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT}}"
+          AAPT="$(find "$SDK/build-tools" -type f -name aapt | sort -V | tail -n 1)"
+          test -x "$AAPT" || { echo '::error::Android aapt tool missing; cannot verify APK identity.'; exit 1; }
+          BADGING="$($AAPT dump badging "$APK")"
+          grep -F "versionName='1.98.63-v98.63'" <<< "$BADGING" || { echo '::error::APK versionName does not match selected source.'; exit 1; }
+          grep -F "versionCode='1098063'" <<< "$BADGING" || { echo '::error::APK versionCode does not match selected source.'; exit 1; }
+          echo 'APK package identity verified: 1.98.63-v98.63 (1098063)'
+          sha256sum "$APK"
+          ls -lh "$APK"
+
+      - name: Upload Android debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SA-Calculator-Debug-APK-${{ steps.locate.outputs.app_version }}
+          path: ${{ steps.locate.outputs.app_dir }}/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Print failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          echo 'Build failed. Review the first red step above for the originating error.'
+          echo "Runner: $RUNNER_OS"
+          node --version || true
+          npm --version || true
+          java -version || true
+          echo "ANDROID_HOME=${ANDROID_HOME:-not-set}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-not-set}"
